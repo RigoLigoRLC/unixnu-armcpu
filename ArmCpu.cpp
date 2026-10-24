@@ -13,7 +13,9 @@ extern "C" void rtclock_intr (unsigned int);
 // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
 extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
 extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
+extern "C" char sysreg_restore[], cpu_ttep[];
 extern "C" kern_return_t processor_start (processor_t);
+extern "C" void processor_wait_for_start (processor_t);
 extern "C" kern_return_t kernel_thread_start (void (*) (void *, wait_result_t), void *, thread_t *);
 extern "C" void thread_deallocate (thread_t);
 extern "C" thread_t current_thread (void);
@@ -30,12 +32,23 @@ volatile uint64_t armcpu_ipi_selftest_sent = 0;
 // 3 GICD_TYPER, 4 IGRPMODR0, 5 ICC_PMR_EL1, 6 ICC_IGRPEN1_EL1, 7 ICC_SRE_EL1.
 volatile uint32_t armcpu_gic_boot[8];
 volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical core: architectural timer interrupts and SGI 0 taken
+volatile uint32_t armcpu_core_ipi_sent[8][8]; // Indexed by the sending and receiving logical CPU numbers.
+volatile uint32_t armcpu_core_gic[8][8]; // Redistributor offset, group, enabled, WAKER, SRE, CTLR, PMR, IGRPEN1.
+volatile uint32_t armcpu_core_timer_samples[8], armcpu_core_timer_expired[8];
+volatile uint64_t armcpu_core_timer_ticks[8], armcpu_core_timer_ctl[8];
+volatile int32_t armcpu_core_timer_tval[8];
+volatile uint32_t armcpu_core_pending[8], armcpu_core_active[8];
+volatile uint32_t armcpu_ipi_first_pending[8][8]; // Target pending bits after the first send for each CPU pair.
+volatile uint64_t armcpu_ipi_first_sgi[8][8]; // Affinity operand constructed for the first send for each CPU pair.
+volatile uint32_t armcpu_secondary_entry[8] __attribute__((aligned(64))); // Reset entry: 1 CPU data found, 2 entering common_start, 3 reached arm_init_cpu.
+volatile uint32_t armcpu_scheduler_online[8]; // processor_wait_for_start observed the CPU leave startup state.
 static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
+static bool gRedistributorIpi = false;      // armcpu-redist-ipi=1 writes SGI0 pending on the target redistributor.
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
 volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
 // Secondary-CPU bring-up evidence (sheng-smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
-// 4 PSCI CPU_ON issued, 5 entered initCPU on the new core, 6 GIC redistributor ready, 7 running.
+// 4 PSCI CPU_ON issued, 5 entered initCPU on the new core, 6 GIC redistributor ready, 7 interrupt interface ready, 8 scheduler startup finished.
 volatile uint32_t armcpu_smp_requested = 0, armcpu_smp_running = 0, armcpu_smp_conduit = 0;
 volatile uint32_t armcpu_smp_step[8], armcpu_smp_mpidr[8], armcpu_smp_seen_mpidr[8], armcpu_smp_fail[8], armcpu_boot_mpidr = 0;
 // System registers seen on each secondary core at initCPU entry: CurrentEL, SCTLR_EL1, TCR_EL1, MAIR_EL1 (low words), MIDR_EL1.
@@ -86,8 +99,8 @@ public:
 
 OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 
-// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
+// Redistributor ISENABLER0 enables the scheduler's SGI 0 and virtual timer PPI 27.
+static const uint32_t kSgiPpiEnable = 1U | (1U << 27);
 
 static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
 
@@ -125,7 +138,7 @@ static void spiIpiSend (uintptr_t dist, uint32_t core)
 static uint64_t counter (void)
 {
   uint64_t value;
-  __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (value));
+  __asm__ volatile ("isb\n\tmrs %0, cntvct_el0" : "=r" (value) :: "memory");
   return value;
 }
 
@@ -183,10 +196,14 @@ IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
     return nullptr;
   }
   memcpy (&id, reg->getBytesNoCopy (), sizeof (id));
-  if (ml_get_cpu_number (id) != ml_get_boot_cpu_number ()) {
+  const int cpu = ml_get_cpu_number (id);
+  if (cpu < 0 || cpu >= ARMCPU_SMP_SLOTS) {
+    return nullptr;
+  }
+  if (cpu != ml_get_boot_cpu_number ()) {
     unsigned smp = 0;
     PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
-    if (smp == 0 || ml_get_cpu_number (id) < 0 || ml_get_cpu_number (id) >= ARMCPU_SMP_SLOTS) {
+    if (smp == 0) {
       return nullptr; // Secondary startup is opt-in (sheng-smp=1).
     }
   }
@@ -298,9 +315,13 @@ bool ArmCpu::wakeRedistributor (bool local)
   if (!waitClear (redist, 0x14, 4)) { return false; }
   uintptr_t sgi = redist + 0x10000;
   write32 (sgi, 0x180, 0xffffffff);
+  if (!waitClear (redist, 0, 8)) {
+    return false;
+  }
   write32 (sgi, 0x80, 0xffffffff);
   write32 (sgi, 0xd00, 0);
   write32 (sgi, 0x280, 0xffffffff);
+  write32 (sgi, 0xc04, read32 (sgi, 0xc04) & ~(2U << ((27 - 16) * 2)));
   for (unsigned offset = 0x400; offset < 0x420; offset += 4) {
     write32 (sgi, offset, 0x80808080);
   }
@@ -321,7 +342,7 @@ void ArmCpu::enableGic (void)
   uint64_t value;
   __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
   value |= 1;
-  __asm__ volatile ("msr icc_sre_el1, %0; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr icc_sre_el1, %0\n\tisb" :: "r" (value) : "memory");
   __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
   if ((value & 1) == 0) { panic ("ArmCpu: GICv3 system register interface unavailable"); }
   __asm__ volatile ("mrs %0, icc_ctlr_el1" : "=r" (value));
@@ -334,10 +355,24 @@ void ArmCpu::enableGic (void)
   if (!secondary) { gBootAffinity = affinity & 0xff00ffffffULL; }
   if (!secondary || !gRemoteGic) {
     write32 (redist + 0x10000, 0x100, kSgiPpiEnable);
+  }
+  if (!secondary) {
     write32 (dist, 0, read32 (dist, 0) | 0x12U);
   }
   value = 1;
-  __asm__ volatile ("msr icc_igrpen1_el1, %0; dsb sy; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
+  armcpu_core_gic[logicalId][0] = static_cast<uint32_t> (redist - redistBase);
+  armcpu_core_gic[logicalId][1] = read32 (redist + 0x10000, 0x80);
+  armcpu_core_gic[logicalId][2] = read32 (redist + 0x10000, 0x100);
+  armcpu_core_gic[logicalId][3] = read32 (redist, 0x14);
+  __asm__ volatile ("mrs %0, icc_sre_el1" : "=r" (value));
+  armcpu_core_gic[logicalId][4] = static_cast<uint32_t> (value);
+  __asm__ volatile ("mrs %0, icc_ctlr_el1" : "=r" (value));
+  armcpu_core_gic[logicalId][5] = static_cast<uint32_t> (value);
+  __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (value));
+  armcpu_core_gic[logicalId][6] = static_cast<uint32_t> (value);
+  __asm__ volatile ("mrs %0, icc_igrpen1_el1" : "=r" (value));
+  armcpu_core_gic[logicalId][7] = static_cast<uint32_t> (value);
   if (!secondary) {
     uint64_t pmr, ig, sre;
     __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (pmr));
@@ -367,6 +402,12 @@ bool ArmCpu::start (IOService *provider)
   unsigned spiIpi = 0;
   PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
   gSpiIpi = spiIpi == 1;
+  unsigned redistributorIpi = 0;
+  PE_parse_boot_argn ("armcpu-redist-ipi", &redistributorIpi, sizeof (redistributorIpi));
+  gRedistributorIpi = redistributorIpi == 1;
+  if (gRedistributorIpi && gSpiIpi) {
+    panic ("ArmCpu: select only one MMIO IPI method");
+  }
   unsigned diagnostic = 0;
   PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
   diagnosePower=diagnostic==1;
@@ -384,12 +425,16 @@ bool ArmCpu::start (IOService *provider)
     if (cpuName == nullptr) { return false; }
     retain ();
     __atomic_store_n (&gPending[logicalId], this, __ATOMIC_RELEASE);
-    if (gBootRegistered != 0) { drainPending (); }
+    if (__atomic_load_n (&gBootRegistered, __ATOMIC_ACQUIRE) != 0) {
+      drainPending ();
+    }
     return true;
   } else {
     uint64_t bootMpidr;
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (bootMpidr));
     armcpu_boot_mpidr = static_cast<uint32_t> (bootMpidr);
+    armcpu_smp_mpidr[logicalId] = physical;
+    armcpu_smp_seen_mpidr[logicalId] = static_cast<uint32_t> (bootMpidr);
     if ((!skipGic && !prepareGic ()) || !IOCPU::start (provider)) { return false; }
   }
   cpuName = OSSymbol::withCStringNoCopy ("ARM architectural boot CPU");
@@ -424,6 +469,10 @@ bool ArmCpu::start (IOService *provider)
   }
   gController = controller;
   initCPU (true);
+  armcpu_smp_step[logicalId] = 8;
+  armcpu_scheduler_online[logicalId] = 1;
+  IOLog ("ArmCpu: boot CPU %u affinity=%llx topology=%u SGI=0 timer=PPI27\n",
+         logicalId, affinity, cpuCount);
   registerService ();
   __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_RELEASE);
   drainPending ();
@@ -443,7 +492,11 @@ bool ArmCpu::finishSecondary (void)
   dist = gDist;
   redistBase = gFrames;
   redistSize = gFramesSize;
-  if (gRemoteGic && !wakeRedistributor (false)) { armcpu_smp_fail[logicalId] = 3; return false; }
+  if (gRemoteGic && !wakeRedistributor (false)) {
+    armcpu_smp_fail[logicalId] = 3;
+    IOLog ("ArmCpu: CPU %u remote redistributor setup failed\n", logicalId);
+    return false;
+  }
   ml_processor_info_t info = {};
   info.cpu_id = this;
   info.phys_id = static_cast<uint32_t> (affinity);
@@ -452,7 +505,11 @@ bool ArmCpu::finishSecondary (void)
   info.cluster_type = ml_get_boot_cluster_type ();
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
-  if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
+  if (status != KERN_SUCCESS) {
+    armcpu_smp_fail[logicalId] = 4;
+    IOLog ("ArmCpu: CPU %u registration failed status=%d\n", logicalId, status);
+    return false;
+  }
   setCPUNumber (info.log_id);
   armcpu_smp_step[logicalId] = 2;
   setCPUState (kIOCPUStateUninitalized);
@@ -484,9 +541,9 @@ static int64_t psciCall (bool hvc, uint64_t function, uint64_t a, uint64_t b, ui
   register uint64_t x2 __asm__ ("x2") = b;
   register uint64_t x3 __asm__ ("x3") = c;
   if (hvc) {
-    __asm__ volatile ("hvc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+    __asm__ volatile ("hvc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) :: "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory", "cc");
   } else {
-    __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+    __asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) :: "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory", "cc");
   }
   return static_cast<int64_t> (x0);
 }
@@ -495,8 +552,17 @@ void ArmCpu::startThread (void *argument, wait_result_t)
 {
   ArmCpu *self = static_cast<ArmCpu *> (argument);
   armcpu_smp_step[self->logicalId] = 3;
-  // Blocks until the new core reaches the scheduler; a core that never arrives only stalls this helper thread.
-  processor_start (self->machProcessor);
+  kern_return_t status = processor_start (self->machProcessor);
+  if (status == KERN_SUCCESS) {
+    processor_wait_for_start (self->machProcessor);
+    __atomic_store_n (&armcpu_scheduler_online[self->logicalId], 1U, __ATOMIC_RELEASE);
+    armcpu_smp_step[self->logicalId] = 8;
+  } else {
+    armcpu_smp_fail[self->logicalId] = 5;
+  }
+  IOLog ("ArmCpu: CPU %u scheduler startup status=%d entry=%u timer=%u ipi=%u\n",
+         self->logicalId, status, armcpu_secondary_entry[self->logicalId],
+         armcpu_core_timer[self->logicalId], armcpu_core_sgi[self->logicalId]);
   thread_terminate (current_thread ());
 }
 
@@ -505,6 +571,7 @@ void ArmCpu::startSecondary (void)
   thread_t thread;
   if (kernel_thread_start (&ArmCpu::startThread, this, &thread) != KERN_SUCCESS) {
     armcpu_smp_psci_rc[logicalId] = -1000;
+    IOLog ("ArmCpu: CPU %u startup thread allocation failed\n", logicalId);
     return;
   }
   thread_deallocate (thread);
@@ -512,15 +579,30 @@ void ArmCpu::startSecondary (void)
 
 void ArmCpu::initCPU (bool boot)
 {
+  uint64_t registers[5];
+  __asm__ volatile ("mrs %0, CurrentEL" : "=r" (registers[0]));
+  __asm__ volatile ("mrs %0, sctlr_el1" : "=r" (registers[1]));
+  __asm__ volatile ("mrs %0, tcr_el1" : "=r" (registers[2]));
+  __asm__ volatile ("mrs %0, mair_el1" : "=r" (registers[3]));
+  __asm__ volatile ("mrs %0, midr_el1" : "=r" (registers[4]));
+  for (unsigned index = 0; index < 5; index++) {
+    armcpu_smp_sys[logicalId][index] = static_cast<uint32_t> (registers[index]);
+  }
+
   if (secondary) {
     if (!boot) { panic ("ArmCpu: secondary resume is unsupported"); }
     armcpu_smp_step[logicalId] = 5;
     uint64_t mpidr;
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
     armcpu_smp_seen_mpidr[logicalId] = static_cast<uint32_t> (mpidr);
-    // A failure is recorded and the core parked (rather than a panic that hides the other cores' state).
-    if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; for (;;) { __asm__ volatile ("wfe"); } }
-    if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; for (;;) { __asm__ volatile ("wfe"); } }
+    if ((mpidr & 0xffff) != (affinity & 0xffff)) {
+      armcpu_smp_fail[logicalId] = 1;
+      panic ("ArmCpu: CPU %u affinity mismatch expected=%llx observed=%llx", logicalId, affinity, mpidr);
+    }
+    if (!gRemoteGic && !wakeRedistributor (true)) {
+      armcpu_smp_fail[logicalId] = 2;
+      panic ("ArmCpu: CPU %u redistributor initialization failed affinity=%llx", logicalId, mpidr);
+    }
     armcpu_smp_step[logicalId] = 6;
     enableGic ();
     if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
@@ -530,10 +612,10 @@ void ArmCpu::initCPU (bool boot)
     enableCPUTimeBase (true);
     setCPUState (kIOCPUStateRunning);
     armcpu_smp_step[logicalId] = 7;
-    armcpu_smp_running = armcpu_smp_running + 1;
+    __atomic_fetch_add (&armcpu_smp_running, 1U, __ATOMIC_RELAXED);
     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
-    if (gSelfIpi) { signalCPU (this); }
+    signalCPU (this);
     return;
   }
   if (!boot) { panic ("ArmCpu: secondary/resume CPU startup is unsupported"); }
@@ -547,7 +629,9 @@ void ArmCpu::initCPU (bool boot)
   if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
   enableCPUTimeBase (true);
   setCPUState (kIOCPUStateRunning);
-  if (gSelfIpi) { signalCPU (this); }
+  if (gSmpWanted || gSelfIpi) {
+    signalCPU (this);
+  }
 }
 
 void ArmCpu::dispatch (void *target, void *, void *, int)
@@ -566,19 +650,35 @@ void ArmCpu::interrupt (void)
     if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
     if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
     if ((id & 0xffffff) == 27) {
-      armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
+      __atomic_fetch_add (&armcpu_timer_interrupts, 1ULL, __ATOMIC_RELAXED);
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
+      if ((armcpu_core_timer[logicalId] & 1023U) == 1) {
+        uint64_t control, value;
+        __asm__ volatile ("mrs %0, cntv_ctl_el0" : "=r" (control));
+        __asm__ volatile ("mrs %0, cntv_tval_el0" : "=r" (value));
+        armcpu_core_timer_ctl[logicalId] = control;
+        armcpu_core_timer_tval[logicalId] = static_cast<int32_t> (value);
+        armcpu_core_timer_ticks[logicalId] = counter ();
+        armcpu_core_timer_samples[logicalId] = armcpu_core_timer_samples[logicalId] + 1;
+        if ((control & 4) != 0) {
+          armcpu_core_timer_expired[logicalId] = armcpu_core_timer_expired[logicalId] + 1;
+        }
+        armcpu_core_pending[logicalId] = read32 (redist + 0x10000, 0x200);
+        armcpu_core_active[logicalId] = read32 (redist + 0x10000, 0x300);
+      }
       armcpu_irq_phase=2;
       rtclock_intr (0);
       armcpu_irq_phase=3;
     } else if ((id & 0xffffff) == 0) {
-      armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
+      __atomic_fetch_add (&armcpu_ipi_interrupts, 1ULL, __ATOMIC_RELAXED);
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
+      armcpu_core_pending[logicalId] = read32 (redist + 0x10000, 0x200);
+      armcpu_core_active[logicalId] = read32 (redist + 0x10000, 0x300);
       armcpu_irq_phase=4;
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase=5;
     } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
-      armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
+      __atomic_fetch_add (&armcpu_ipi_interrupts, 1ULL, __ATOMIC_RELAXED);
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
       armcpu_irq_phase = 4;
       if (ipi_handler != nullptr) { ipi_handler (); }
@@ -603,7 +703,7 @@ void ArmCpu::interrupt (void)
       }
     }
     armcpu_irq_phase=6;
-    __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (id) : "memory");
+    __asm__ volatile ("msr icc_eoir1_el1, %0\n\tisb" :: "r" (id) : "memory");
   }
 }
 
@@ -616,9 +716,24 @@ void ArmCpu::signalCPU (IOCPU *target)
   uint64_t aff = peer->signalTarget ();
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) |
                  ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
-  armcpu_ipi_sent = armcpu_ipi_sent + 1;
+  __atomic_fetch_add (&armcpu_ipi_sent, 1ULL, __ATOMIC_RELAXED);
+  const uint32_t previous = __atomic_fetch_add (&armcpu_core_ipi_sent[logicalId][peer->logicalId], 1U, __ATOMIC_RELAXED);
   if (gSpiIpi) { spiIpiSend (gDist, peer->logicalId & 7); return; }
-  __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
+  if (gRedistributorIpi) {
+    if (peer->redist == 0) {
+      panic ("ArmCpu: CPU %u redistributor unavailable for IPI", peer->logicalId);
+    }
+    // GICv3 GICR_ISPENDR0 sets pending state for the target frame's non-secure SGI0.
+    __asm__ volatile ("dsb ishst" ::: "memory");
+    write32 (peer->redist + 0x10000, 0x200, 1U);
+    __asm__ volatile ("dsb sy" ::: "memory");
+  } else {
+    __asm__ volatile ("dsb ishst\n\tmsr icc_sgi1r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
+  }
+  if (previous == 0) {
+    armcpu_ipi_first_sgi[logicalId][peer->logicalId] = sgi;
+    armcpu_ipi_first_pending[logicalId][peer->logicalId] = read32 (peer->redist + 0x10000, 0x200);
+  }
 }
 
 // Diagnostic: sends SGI 0 to the core whose MPIDR affinity is aff (the DT "reg" value, e.g. 0x100 for core 1) exactly as signalCPU
@@ -664,7 +779,7 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
 {
   uint64_t mpidr, daif, v;
   __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
-  __asm__ volatile ("mrs %0, daif; msr daifset, #2; isb" : "=r" (daif) :: "memory");
+  __asm__ volatile ("mrs %0, daif\n\tmsr daifset, #2\n\tisb" : "=r" (daif) :: "memory");
   for (unsigned i = 0; i < 10; i++) { out[i] = 0; }
   out[0] = mpidr;
   __asm__ volatile ("mrs %0, icc_pmr_el1" : "=r" (v)); out[3] = v;
@@ -677,8 +792,8 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
     for (uint64_t intid = 0; intid < 16; intid++) {
       const uint64_t sgi = base | (intid << 24);
       uint64_t h = 1023, ta, tb;
-      __asm__ volatile ("dsb ishst; isb; mrs %0, cntvct_el0; isb" : "=r" (ta) :: "memory");
-      __asm__ volatile ("msr icc_sgi1r_el1, %0; isb; mrs %1, cntvct_el0" : "=r" (tb) : "r" (sgi) : "memory");
+      __asm__ volatile ("dsb ishst\n\tisb\n\tmrs %0, cntvct_el0\n\tisb" : "=r" (ta) :: "memory");
+      __asm__ volatile ("msr icc_sgi1r_el1, %1\n\tisb\n\tmrs %0, cntvct_el0" : "=r" (tb) : "r" (sgi) : "memory");
       if (intid == 0) { out[8] = tb - ta; }
       for (unsigned polls = 0; polls < 400; polls++) {
         __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (h));
@@ -688,10 +803,10 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
       if ((h & 0xffffff) == intid) {
         out[1] |= 1ULL << intid;
         __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (v));
-        __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (v) : "memory");
+        __asm__ volatile ("msr icc_eoir1_el1, %0\n\tisb" :: "r" (v) : "memory");
         continue;
       }
-      __asm__ volatile ("dsb ishst; msr icc_sgi0r_el1, %0; isb" :: "r" (sgi) : "memory");
+      __asm__ volatile ("dsb ishst\n\tmsr icc_sgi0r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
       for (unsigned polls = 0; polls < 400; polls++) {
         __asm__ volatile ("mrs %0, icc_hppir0_el1" : "=r" (h));
         if ((h & 0xffffff) == intid) { break; }
@@ -700,16 +815,18 @@ extern "C" void armcpu_sgi_selfprobe (uint64_t *out)
       if ((h & 0xffffff) == intid) {
         out[2] |= 1ULL << intid;
         __asm__ volatile ("mrs %0, icc_iar0_el1" : "=r" (v));
-        __asm__ volatile ("msr icc_eoir0_el1, %0; isb" :: "r" (v) : "memory");
+        __asm__ volatile ("msr icc_eoir0_el1, %0\n\tisb" :: "r" (v) : "memory");
       }
     }
   }
   {
     uint64_t ta, tb;
-    __asm__ volatile ("isb; mrs %0, cntvct_el0; isb; mrs %2, icc_pmr_el1; isb; mrs %1, cntvct_el0" : "=r" (ta), "=r" (tb), "=r" (v) :: "memory");
+    ta = counter ();
+    __asm__ volatile ("isb\n\tmrs %0, icc_pmr_el1\n\tisb" : "=r" (v) :: "memory");
+    tb = counter ();
     out[9] = tb - ta;
   }
-  __asm__ volatile ("msr daif, %0; isb" :: "r" (daif) : "memory");
+  __asm__ volatile ("msr daif, %0\n\tisb" :: "r" (daif) : "memory");
 }
 
 extern "C" void armcpu_ipi_selftest (uint64_t aff)
@@ -717,13 +834,13 @@ extern "C" void armcpu_ipi_selftest (uint64_t aff)
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) | ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
   armcpu_ipi_selftest_sent = armcpu_ipi_selftest_sent + 1;
   if (gSpiIpi) { spiIpiSend (gDist, static_cast<uint32_t> ((aff >> 8) & 7)); return; }
-  __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
+  __asm__ volatile ("dsb ishst\n\tmsr icc_sgi1r_el1, %0\n\tisb" :: "r" (sgi) : "memory");
 }
 
 void ArmCpu::enableCPUTimeBase (bool enabled)
 {
   uint64_t value = enabled ? 1 : 2;
-  __asm__ volatile ("msr cntv_ctl_el0, %0; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr cntv_ctl_el0, %0\n\tisb" :: "r" (value) : "memory");
 }
 
 void ArmCpu::quiesceCPU (void)
@@ -732,7 +849,7 @@ void ArmCpu::quiesceCPU (void)
   if(diagnosePower)panic("ArmCpu: unsupported quiesce requested before timer/GIC disable caller=%p halt=%u timer=%llu phase=%u",__builtin_return_address(0),armcpu_halt_calls,armcpu_timer_interrupts,armcpu_irq_phase);
   enableCPUTimeBase (false);
   uint64_t value = 0;
-  __asm__ volatile ("msr icc_igrpen1_el1, %0; dsb sy; isb" :: "r" (value) : "memory");
+  __asm__ volatile ("msr icc_igrpen1_el1, %0\n\tdsb sy\n\tisb" :: "r" (value) : "memory");
 }
 
 void ArmCpu::haltCPU (void)
@@ -753,8 +870,10 @@ static void cleanToMemory (const void *start, size_t length)
   __asm__ volatile ("mrs %0, ctr_el0" : "=r" (ctr));
   uintptr_t line = static_cast<uintptr_t> (4) << ((ctr >> 16) & 15);
   uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~(line - 1), end = reinterpret_cast<uintptr_t> (start) + length;
-  for (; address < end; address += line) { __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory"); }
-  __asm__ volatile ("dsb sy; isb" ::: "memory");
+  for (; address < end; address += line) {
+    __asm__ volatile ("dc cvac, %0" :: "r" (address) : "memory");
+  }
+  __asm__ volatile ("dsb sy\n\tisb" ::: "memory");
 }
 
 kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
@@ -769,10 +888,63 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
   cleanToMemory (ResetHandlerData, 0x1000);
   cleanToMemory (const_boot_args, 0x1000);
+  cleanToMemory (sysreg_restore, 0x1000);
+  cleanToMemory (cpu_ttep, sizeof (uint64_t));
+  cleanToMemory (const_cast<const uint32_t *> (armcpu_secondary_entry), sizeof (armcpu_secondary_entry));
   armcpu_smp_step[logicalId] = 4;
+  IOLog ("ArmCpu: CPU %u PSCI CPU_ON affinity=%llx entry=%llx conduit=%s\n",
+         logicalId, affinity & 0xff00ffffffULL, entry, hvc ? "hvc" : "smc");
   int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, entry, 0);
   armcpu_smp_psci_rc[logicalId] = static_cast<int32_t> (result);
+  IOLog ("ArmCpu: CPU %u PSCI CPU_ON result=%lld\n", logicalId, result);
+  if (result != 0) {
+    panic ("ArmCpu: CPU %u PSCI CPU_ON failed result=%lld affinity=%llx", logicalId, result, affinity);
+  }
   return result == 0 ? KERN_SUCCESS : KERN_FAILURE;
+}
+
+// This snapshot uses counters and register values saved by each CPU during initialization.
+// The USB command worker prints it without reading another CPU's MMIO or changing interrupt state.
+extern "C" void armcpu_dump_smp (void)
+{
+  static uint64_t previousTicks;
+  static uint32_t previousTimers[ARMCPU_SMP_SLOTS];
+  const unsigned count = static_cast<unsigned> (ml_get_max_cpu_number ()) + 1;
+  const uint64_t ticks = counter ();
+  uint64_t frequency;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (frequency));
+  IOLog ("ArmCpu: cpus=%u secondary-ready=%u conduit=%u IPI=%s timer=PPI27 tlb=inner-shareable\n",
+         count, armcpu_smp_running, armcpu_smp_conduit,
+         gRedistributorIpi ? "GICR-SGI0" : (gSpiIpi ? "SPI" : "ICC-SGI0"));
+  IOLog ("ArmCpu: counter=%llu frequency=%llu elapsed=%llu GICD_CTLR=%x TYPER=%x\n",
+         ticks, frequency, previousTicks == 0 ? 0 : ticks - previousTicks,
+         armcpu_gic_boot[2], armcpu_gic_boot[3]);
+  for (unsigned cpu = 0; cpu < count && cpu < ARMCPU_SMP_SLOTS; cpu++) {
+    const uint32_t timerCount = armcpu_core_timer[cpu];
+    IOLog ("ArmCpu: CPU %u affinity=%x seen=%x entry=%u step=%u online=%u fail=%u psci=%d timer=%u ipi=%u\n",
+           cpu, armcpu_smp_mpidr[cpu], armcpu_smp_seen_mpidr[cpu], armcpu_secondary_entry[cpu],
+           armcpu_smp_step[cpu], __atomic_load_n (&armcpu_scheduler_online[cpu], __ATOMIC_ACQUIRE),
+           armcpu_smp_fail[cpu], armcpu_smp_psci_rc[cpu], armcpu_core_timer[cpu], armcpu_core_sgi[cpu]);
+    IOLog ("ArmCpu: CPU %u GICR=%x group=%x enabled=%x waker=%x sre=%x ctlr=%x pmr=%x grp1=%x\n",
+           cpu, armcpu_core_gic[cpu][0], armcpu_core_gic[cpu][1], armcpu_core_gic[cpu][2],
+           armcpu_core_gic[cpu][3], armcpu_core_gic[cpu][4], armcpu_core_gic[cpu][5],
+           armcpu_core_gic[cpu][6], armcpu_core_gic[cpu][7]);
+    IOLog ("ArmCpu: CPU %u EL=%x SCTLR=%x TCR=%x MAIR=%x MIDR=%x\n", cpu,
+           armcpu_smp_sys[cpu][0], armcpu_smp_sys[cpu][1], armcpu_smp_sys[cpu][2],
+           armcpu_smp_sys[cpu][3], armcpu_smp_sys[cpu][4]);
+    IOLog ("ArmCpu: CPU %u timer-delta=%u sample-ticks=%llu ctl=%llx tval=%d samples=%u expired=%u pending=%x active=%x\n",
+           cpu, previousTicks == 0 ? 0 : timerCount - previousTimers[cpu],
+           armcpu_core_timer_ticks[cpu], armcpu_core_timer_ctl[cpu], armcpu_core_timer_tval[cpu],
+           armcpu_core_timer_samples[cpu], armcpu_core_timer_expired[cpu],
+           armcpu_core_pending[cpu], armcpu_core_active[cpu]);
+    previousTimers[cpu] = timerCount;
+    for (unsigned target = 0; target < count && target < ARMCPU_SMP_SLOTS; target++) {
+      IOLog ("ArmCpu: IPI %u->%u sent=%u first-sgi=%llx first-pending=%x\n", cpu, target,
+             __atomic_load_n (&armcpu_core_ipi_sent[cpu][target], __ATOMIC_RELAXED),
+             armcpu_ipi_first_sgi[cpu][target], armcpu_ipi_first_pending[cpu][target]);
+    }
+  }
+  previousTicks = ticks;
 }
 
 const OSSymbol *ArmCpu::getCPUName (void)
