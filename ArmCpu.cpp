@@ -2,6 +2,8 @@
 #include <IOKit/IOCPU.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSSymbol.h>
 #include <machine/machine_routines.h>
@@ -179,6 +181,7 @@ static bool gRemoteGic = false; // sheng-smp-gic=1: the boot CPU prepares a new 
 struct ArmCpuSpi {uint32_t id; void (*handler) (void *); void *context; volatile uint64_t count;};
 static ArmCpuSpi gSpi[ARMCPU_SPI_SLOTS];
 static volatile uint32_t gSpiUsed = 0;
+static IOLock *gSpiRegistrationLock = nullptr;
 static uint64_t gBootAffinity = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
@@ -332,6 +335,11 @@ bool ArmCpu::wakeRedistributor (bool local)
 
 bool ArmCpu::prepareGic (void)
 {
+  gSpiRegistrationLock = IOLockAlloc ();
+  if (gSpiRegistrationLock == nullptr) {
+    return false;
+  }
+
   if (!mapGic () || !initDistributor () || !wakeRedistributor (true)) { return false; }
   gGicShared = 1;
   return true;
@@ -444,10 +452,11 @@ bool ArmCpu::start (IOService *provider)
   info.phys_id = physical;
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = ml_get_topology_info ()->cpus[logicalId].cluster_type;
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+  IOLog ("ArmCpu: CPU %u scheduler cluster=%u type=%u\n", logicalId, info.cluster_id, info.cluster_type);
   setCPUNumber (info.log_id);
   armcpu_registered = 1;
   unsigned smp = 0;
@@ -502,7 +511,7 @@ bool ArmCpu::finishSecondary (void)
   info.phys_id = static_cast<uint32_t> (affinity);
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = ml_get_topology_info ()->cpus[logicalId].cluster_type;
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) {
@@ -510,6 +519,7 @@ bool ArmCpu::finishSecondary (void)
     IOLog ("ArmCpu: CPU %u registration failed status=%d\n", logicalId, status);
     return false;
   }
+  IOLog ("ArmCpu: CPU %u scheduler cluster=%u type=%u\n", logicalId, info.cluster_id, info.cluster_type);
   setCPUNumber (info.log_id);
   armcpu_smp_step[logicalId] = 2;
   setCPUState (kIOCPUStateUninitalized);
@@ -953,8 +963,8 @@ const OSSymbol *ArmCpu::getCPUName (void)
 }
 
 // Readback after configuration: bit 0 group 1, bit 1 enabled, bit 2 edge, bits 8..15 priority; IROUTER separately.
-extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler) (void *), void *context,
-                                       uint32_t *readback, uint64_t *router)
+static IOReturn attachSpi (uint32_t intid, bool edge, void (*handler) (void *), void *context,
+                           uint32_t *readback, uint64_t *router)
 {
   if (gDist == 0 || armcpu_gic_ready == 0 || handler == nullptr) { return kIOReturnNotReady; }
   const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
@@ -983,6 +993,22 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   }
   if (router != nullptr) { *router = *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid); }
   return kIOReturnSuccess;
+}
+
+// Driver startup threads serialize distributor register changes and handler publication.
+// Interrupt dispatch reads the published entries without taking the registration lock.
+extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler) (void *), void *context,
+                                       uint32_t *readback, uint64_t *router)
+{
+  if (armcpu_gic_ready == 0 || gSpiRegistrationLock == nullptr) {
+    return kIOReturnNotReady;
+  }
+
+  IOLockLock (gSpiRegistrationLock);
+  IOReturn result = attachSpi (intid, edge, handler, context, readback, router);
+  IOLockUnlock (gSpiRegistrationLock);
+
+  return result;
 }
 
 extern "C" uint64_t armcpu_spi_count (uint32_t intid)
