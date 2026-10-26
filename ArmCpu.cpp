@@ -964,7 +964,7 @@ const OSSymbol *ArmCpu::getCPUName (void)
 
 // Readback after configuration: bit 0 group 1, bit 1 enabled, bit 2 edge, bits 8..15 priority; IROUTER separately.
 static IOReturn attachSpi (uint32_t intid, bool edge, void (*handler) (void *), void *context,
-                           uint32_t *readback, uint64_t *router)
+                           uint32_t *readback, uint64_t *router, bool enable)
 {
   if (gDist == 0 || armcpu_gic_ready == 0 || handler == nullptr) { return kIOReturnNotReady; }
   const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
@@ -985,7 +985,10 @@ static IOReturn attachSpi (uint32_t intid, bool edge, void (*handler) (void *), 
   gSpi[used] = {intid, handler, context, 0};
   __atomic_store_n (&gSpiUsed, used + 1, __ATOMIC_RELEASE);
   __asm__ volatile ("dsb sy" ::: "memory");
-  write32 (gDist, 0x100 + word, bit); // ISENABLER
+  if (enable) {
+    write32 (gDist, 0x100 + word, bit); // ISENABLER
+    __asm__ volatile ("dsb sy" ::: "memory");
+  }
   if (readback != nullptr) {
     *readback = ((read32 (gDist, 0x80 + word) & bit) ? 1U : 0U) | ((read32 (gDist, 0x100 + word) & bit) ? 2U : 0U) |
                 (((read32 (gDist, cfg) >> shift) & 1U) << 2) |
@@ -1005,10 +1008,67 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   }
 
   IOLockLock (gSpiRegistrationLock);
-  IOReturn result = attachSpi (intid, edge, handler, context, readback, router);
+  IOReturn result = attachSpi (intid, edge, handler, context, readback, router, true);
   IOLockUnlock (gSpiRegistrationLock);
 
   return result;
+}
+
+// Registration publishes the callback while the distributor line remains disabled.
+extern "C" IOReturn armcpu_spi_register (uint32_t intid, bool edge, void (*handler) (void *), void *context)
+{
+  if (armcpu_gic_ready == 0 || gSpiRegistrationLock == nullptr) {
+    return kIOReturnNotReady;
+  }
+
+  IOLockLock (gSpiRegistrationLock);
+  IOReturn result = attachSpi (intid, edge, handler, context, nullptr, nullptr, false);
+  IOLockUnlock (gSpiRegistrationLock);
+
+  return result;
+}
+
+// Enable and disable only use write-one distributor registers after registration.
+// They are also callable by an interrupt handler and never take a sleeping lock.
+static IOReturn setSpiEnabled (uint32_t intid, bool enabled)
+{
+  if (gDist == 0 || armcpu_gic_ready == 0) {
+    return kIOReturnNotReady;
+  }
+
+  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
+  bool registered = false;
+  for (uint32_t slot = 0; slot < used; ++slot) {
+    if (gSpi[slot].id == intid) {
+      registered = true;
+      break;
+    }
+  }
+  if (!registered) {
+    return kIOReturnNotFound;
+  }
+
+  const uint32_t word = (intid / 32) * 4;
+  const uint32_t bit = 1U << (intid % 32);
+  __asm__ volatile ("dsb sy" ::: "memory");
+  write32 (gDist, (enabled ? 0x100 : 0x180) + word, bit);
+  __asm__ volatile ("dsb sy" ::: "memory");
+  if (!enabled && !waitClear (gDist, 0, 1U << 31)) {
+    return kIOReturnTimeout;
+  }
+
+  const bool actual = (read32 (gDist, 0x100 + word) & bit) != 0;
+  return actual == enabled ? kIOReturnSuccess : kIOReturnIOError;
+}
+
+extern "C" IOReturn armcpu_spi_enable (uint32_t intid)
+{
+  return setSpiEnabled (intid, true);
+}
+
+extern "C" IOReturn armcpu_spi_disable (uint32_t intid)
+{
+  return setSpiEnabled (intid, false);
 }
 
 extern "C" uint64_t armcpu_spi_count (uint32_t intid)
